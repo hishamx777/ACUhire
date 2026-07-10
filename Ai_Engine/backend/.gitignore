@@ -1,0 +1,14 @@
+# Environments
+.venv/
+acuenv/
+
+# Security
+.env
+
+# Cache and compiled files
+__pycache__/
+*.pyc
+
+# Project specific data
+data/
+vectorstore/
