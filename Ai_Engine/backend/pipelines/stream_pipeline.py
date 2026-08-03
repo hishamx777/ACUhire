@@ -1,5 +1,6 @@
 import os
 import json
+import time
 from typing import List, Dict, Any, Optional
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
@@ -14,6 +15,14 @@ load_dotenv()
 # ==========================================
 # 1. Data Structures (Pydantic Models)
 # ==========================================
+class InterviewState(BaseModel):
+    """
+    Tracks the current state of the interview for a specific candidate.
+    """
+    current_question: Optional[QuestionItem] = None
+    accumulated_answer: str = ""
+    question_start_time: float = 0.0
+    history: List[Dict[str, Any]] = [] #The list that will compile the entire interview for the final evaluation.
 
 class QuestionItem(BaseModel):
     """
@@ -56,20 +65,16 @@ class InterviewEngine:
     def __init__(
         self,
         model_name: Optional[str] = None,
-        temperature: float = 0.4  # Slightly higher temp for natural, conversational tone
-    ) -> None:
+        temperature: float = 0.4 
+        ) -> None:
         self.model_name = model_name or os.getenv("GEMINI_MODEL_NAME", "gemini-2.5-flash")
         self.temperature = temperature
-        
-        # Initialize Gemini LLM
-        self.llm = ChatGoogleGenerativeAI(
-            model=self.model_name,
-            temperature=self.temperature
-        )
-        
-        # Initialize Prompt Chains
+        self.llm = ChatGoogleGenerativeAI(model=self.model_name, temperature=self.temperature)
         self.question_chain = self._build_question_chain()
         self.eval_chain = self._build_evaluation_chain()
+        
+        # New: Initialize the state
+        self.state = InterviewState()
 
     def _build_question_chain(self) -> LLMChain:
         """
@@ -180,3 +185,219 @@ class InterviewEngine:
                 feedback="Error processing evaluation.",
                 next_action="follow_up"
             )
+    def fast_keyword_match(
+        self, 
+        candidate_answer: str, 
+        expected_keywords: List[str], 
+        threshold: float = 0.7
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Fast O(N) keyword matching filter to bypass LLM evaluation if the answer is clearly correct.
+        """
+        if not expected_keywords:
+            return None
+            
+        answer_lower = candidate_answer.lower()
+        matched_words = []
+        
+        for kw in expected_keywords:
+            if kw.lower() in answer_lower:
+                matched_words.append(kw)
+
+        hit_ratio = len(matched_words) / len(expected_keywords)
+
+        if hit_ratio >= threshold:
+            score = int(hit_ratio * 100)
+            return {
+                "score": score,
+                "is_acceptable": True,
+                "feedback": f"Auto-approved. Matched key concepts: {', '.join(matched_words)}",
+                "next_action": "advance"
+            }
+        
+        return None
+
+    def process_transcript_chunk(self, transcript_chunk: str) -> Optional[Dict[str, Any]]:
+        """
+        Receives a chunk of speech, adds it to the buffer, and applies the One-Strike rule.
+        """
+        self.state.accumulated_answer += " " + transcript_chunk.strip()
+        
+        if not self.state.current_question:
+            return None
+            
+        fast_eval = self.fast_keyword_match(
+            candidate_answer=self.state.accumulated_answer,
+            expected_keywords=self.state.current_question.expected_keywords,
+            threshold=0.8
+        )
+        
+        if fast_eval:
+            self.state.accumulated_answer = ""
+            return fast_eval
+            
+        return None 
+
+    def finalize_answer(self) -> str:
+        """
+        Called when candidate stops speaking. 
+        Saves the answer and time to history, and uses keyword matching to decide on a follow-up.
+        DOES NOT call the LLM for deep evaluation to save compute.
+        """
+        if not self.state.current_question or not self.state.accumulated_answer.strip():
+            return "follow_up"
+
+        # Calculating actual response time
+        time_taken = time.time() - self.state.question_start_time
+        
+        # Keyword filter for determining follow-ups
+        fast_eval = self.fast_keyword_match(
+            candidate_answer=self.state.accumulated_answer,
+            expected_keywords=self.state.current_question.expected_keywords,
+            threshold=0.6 # If you don't cover 60% of the words, we'll follow back.
+        )
+        
+        next_action = "advance" if fast_eval else "follow_up"
+
+        # Storing the answer for the final evaluation to be conducted after the interview.
+        self.state.history.append({
+            "question": self.state.current_question.question_text,
+            "expected_keywords": self.state.current_question.expected_keywords,
+            "answer": self.state.accumulated_answer,
+            "time_taken": time_taken
+        })
+        
+        # Clearing the memory for the next question
+        self.state.accumulated_answer = ""
+        
+        return next_action # It returns a string to the router so it can generate the sub-question or proceed.
+
+    def generate_interview_bank(self, role: str, core_skills: List[str], num_questions: int = 5) -> List[QuestionItem]:
+        """
+        Pre-computes a queue of interview questions to ensure zero-latency.
+        """
+        print(f"⚙️ Generating {num_questions} questions for {role}...")
+        
+        template = (
+            "You are a Senior Technical Lead in Egypt interviewing a candidate for the {role} position.\n"
+            "Your task is to generate exactly {num_questions} technical interview questions covering these skills: {skills}.\n\n"
+            "CRITICAL RULES:\n"
+            "1. Code-Switching: Speak in natural Egyptian Arabic, but keep ALL technical terms, frameworks, and patterns in ENGLISH.\n"
+            "2. Progression: Start with an 'Easy' question, move to 'Medium', and end with 'Hard'.\n\n"
+            "You MUST output ONLY a valid JSON array of objects, with NO markdown formatting or code blocks. Each object must exactly match this schema:\n"
+            "[\n"
+            "  {{\n"
+            "    \"question_text\": \"Question in Egyptian Arabic + English tech terms\",\n"
+            "    \"expected_keywords\": [\"keyword1\", \"keyword2\"],\n"
+            "    \"difficulty\": \"Easy/Medium/Hard\",\n"
+            "    \"target_skill\": \"skill name\"\n"
+            "  }}\n"
+            "]\n"
+        )
+        
+        prompt = PromptTemplate(
+            input_variables=["role", "skills", "num_questions"],
+            template=template
+        )
+        
+        chain = LLMChain(llm=self.llm, prompt=prompt)
+        
+        try:
+            response = chain.invoke({
+                "role": role,
+                "skills": ", ".join(core_skills),
+                "num_questions": num_questions
+            })
+            
+            raw_text = response.get("text", "").replace("```json", "").replace("```", "").strip()
+            data_list = json.loads(raw_text)
+            
+            return [QuestionItem(**item) for item in data_list]
+            
+        except Exception as e:
+            print(f"Error generating question bank: {e}")
+            return [
+                QuestionItem(
+                    question_text=f"كلمنا عن خبرتك في الـ {skill} وإزاي بتتعامل مع المشاكل اللي بتظهرلك؟",
+                    expected_keywords=[skill.lower(), "experience", "problem solving"],
+                    difficulty="Medium",
+                    target_skill=skill
+                ) for skill in core_skills[:num_questions]
+            ]
+        
+    def _evaluate_accuracy_only(self, question: str, answer: str) -> int:
+        """
+        Evaluates the technical accuracy of the answer based on academic and industry standards.
+        Returns a score from 0 to 100.
+        """
+        template = (
+            "You are an expert AI Technical Evaluator.\n"
+            "Evaluate the candidate's answer to the following technical question.\n"
+            "Compare the answer strictly against academic definitions, official documentation, and standard industry concepts.\n\n"
+            "Question: {question}\n"
+            "Candidate Answer: {answer}\n\n"
+            "You MUST output ONLY an integer between 0 and 100 representing the accuracy score. "
+            "Do not output any text, explanation, or markdown formatting. Just the number.\n"
+        )
+        
+        prompt = PromptTemplate(
+            input_variables=["question", "answer"],
+            template=template
+        )
+        
+        chain = LLMChain(llm=self.llm, prompt=prompt)
+        
+        try:
+            response = chain.invoke({
+                "question": question,
+                "answer": answer
+            })
+            
+            raw_text = response.get("text", "").strip()
+            # Extract just the integer from the response to avoid parsing errors
+            score = int(''.join(filter(str.isdigit, raw_text)))
+            
+            # Ensure the score is within logical bounds
+            return max(0, min(100, score))
+            
+        except Exception as e:
+            print(f"Error in deep evaluation: {e}")
+            return 0  # Fallback score in case of API failure
+        
+    def generate_final_report(self) -> Dict[str, Any]:
+        """
+        Called strictly AFTER the interview is over.
+        Evaluates accuracy based on research/books (60% weight) and response time (40% weight).
+        """
+        print("📊 Generating final comprehensive evaluation report...")
+        final_results = []
+        total_score = 0
+        
+        for item in self.state.history:
+            # 1. Evaluation of technical accuracy solely by an LLM (out of 100)
+            # We will build a new prompt that measures academic accuracy and pass `item["question"]` and `item["answer"]` to it.
+            accuracy_score = self._evaluate_accuracy_only(item["question"], item["answer"])
+            
+            # 2. Quantitative time assessment (out of 100)
+            optimal_time = 30 # الوقت المثالي
+            if item["time_taken"] <= optimal_time:
+                time_score = 100
+            else:
+                penalty = (item["time_taken"] - optimal_time) * 2
+                time_score = max(0, 100 - penalty)
+                
+            # 3. Final calculation (60% accuracy + 40% time)
+            final_item_score = (accuracy_score * 0.60) + (time_score * 0.40)
+            
+            final_results.append({
+                "question": item["question"],
+                "accuracy_score": accuracy_score,
+                "time_score": time_score,
+                "final_score": final_item_score
+            })
+            total_score += final_item_score
+            
+        return {
+            "overall_score": total_score / len(self.state.history) if self.state.history else 0,
+            "details": final_results
+        }

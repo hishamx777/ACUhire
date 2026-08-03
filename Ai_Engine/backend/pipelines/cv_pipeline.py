@@ -90,9 +90,10 @@ class RAGPipeline:
             "Job Description:\n{job_description}\n\n"
             "You MUST output the response ONLY as a valid JSON object with the following exact keys:\n"
             "1. 'match_score': An integer from 0 to 100 representing how well the CV matches the requirements.\n"
-            "2. 'matched_skills': A list of strings containing the skills present in the CV that match the JD.\n"
-            "3. 'missing_skills': A list of strings containing important skills missing from the CV.\n"
-            "4. 'justification': A brief sentence explaining the score.\n"
+            "2. 'matched_skills': A list of strings containing the candidate's strengths and skills present in the CV that match the JD.\n"
+            "3. 'missing_skills': A list of strings containing weaknesses or important skills missing from the CV.\n"
+            "4. 'justification': A detailed explanation of why the candidate received this score (why they are a good fit or why they fall short).\n"
+            "5. 'improvement_tips': A list of actionable tips and advice for the candidate to improve their profile for this specific role.\n"
         )
         prompt = PromptTemplate(
             input_variables=["cv_text", "job_description"],
